@@ -1,0 +1,6 @@
+models/
+nets/
+test/
+train/
+sample_submission.csv
+test.py
