@@ -1,11 +1,8 @@
 import pandas as pd
 from nets.aliked import ALIKED
-import kornia
 import kornia.feature as KF
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 import numpy as np
-from functools import reduce
-import time
 import gc
 import torch
 import cv2
@@ -44,7 +41,7 @@ class Img(object):
     def w(self):
         return self.shape[1]
     
-    def resize(self, size, square=True):
+    def resize(self, size, square=False):
         # ssim的计算只能使用两张形状一致的图像，这与是否旋转是冲突的，所以有时需要拓展为方形图片
         def rot(i):
             return np.transpose(i, (1, 0, 2)) if self.h < self.w else i
@@ -61,10 +58,10 @@ class Img(object):
 
 class Imgs(object):
     def __init__(self, dir):
-        self.data = list(map(Img, sorted(glob(f"{dir}/*"))[:10]))
+        self.data = list(map(Img, sorted(glob(f"{dir}/*"))[:]))
 
-    def resize(self, size):
-        return [img.resize(size) for img in self.data]
+    def resize(self, size, square=False):
+        return [img.resize(size, square=square) for img in self.data]
     
     def __len__(self):
         return len(self.data)
@@ -72,25 +69,32 @@ class Imgs(object):
     def __getitem__(self, key):
         return self.data[key]
 
+def batch_divide(func, n, batch_size=1):
+    if n <= batch_size:
+        return func(slice(0, n))
+    times = int(n / batch_size)
+    start = n - times * batch_size
+    res = []
+    if start != 0:
+        res.append(func(slice(0, start)))
+    for i in range(times):
+        res.append(func(slice(start + i * batch_size, start + (i+1) * batch_size)))
+    return torch.cat(res)
+    
+
 class Ssim(object):
     s = StructuralSimilarityIndexMeasure(data_range=255., reduction='none').cuda()
     size = 2048
-    batch_size = 5
 
     @classmethod
     def score(cls, i1s, i2s):
-        n = i1s.shape[0]
-        if n <= cls.batch_size:
-            return cls.s(i1s, i2s).cpu()
-        res = torch.zeros((n, ), dtype=torch.float32)
-        times = int(n / cls.batch_size)
-        start = n - times * cls.batch_size
-        if start != 0:
-            res[:start] = cls.s(i1s[:start], i2s[:start]).cpu()
-        for i in range(times):
-            s = slice(start + i*cls.batch_size, start + (i+1)*cls.batch_size)
-            res[s] = cls.s(i1s[s], i2s[s]).cpu()
-        return res
+        def f(s):
+            with torch.inference_mode():
+                res = cls.s(i1s[s].cuda(), i2s[s].cuda()).cpu()
+                if res.ndim == 0:
+                    res = torch.tensor([res])
+                return res
+        return batch_divide(f, i1s.shape[0])
 
     @classmethod
     def rot(cls, imgs):
@@ -100,24 +104,25 @@ class Ssim(object):
         imgs4[:, 0] = imgs
         for r in range(1, 4):
             imgs4[:, r] = torch.rot90(imgs, r, (2, 3))
-        with torch.inference_mode():
-            i1s = imgs4[0:1, 0].expand(4*(n-1), -1, -1, -1).cuda()
-            i2s = imgs4[1:].reshape((4*(n-1), ) + imgs4.shape[2:]).cuda()
-            scores = cls.score(i1s, i2s).reshape((n-1, 4))
-            min_diff_idx = torch.cat([torch.tensor([0]), torch.argmax(scores, 1)])
-            return imgs4[torch.arange(n), min_diff_idx]
+        i1s = imgs4[0:1, 0].expand(4*(n-1), -1, -1, -1)
+        i2s = imgs4[1:].reshape((4*(n-1), ) + imgs4.shape[2:])
+        scores = cls.score(i1s, i2s).reshape((n-1, 4))
+        min_diff_idx = torch.cat([torch.tensor([0]), torch.argmax(scores, 1)])
+        return imgs4[torch.arange(n), min_diff_idx]
 
     @classmethod
     def flows(cls, imgs):
+        # 拓展为(batch, channel, height, width)。
+        # 根据SSIM将影像进行旋转校正，但现有数据不存在旋转问题，影像也不是方形的；填充0会影响计算结果，不填充无法计算。为了与原作保持一致，可替换为以下代码。
+        # imgs = cls.rot(torch.tensor(np.transpose(imgs.resize(cls.size, square=True), (0, 3, 1, 2)), dtype=torch.float32))
+        # 与上一行互斥
+        imgs = torch.tensor(np.transpose(imgs.resize(cls.size), (0, 3, 1, 2)), dtype=torch.float32)
         n = len(imgs)
-        # 拓展为(batch, channel, height, width)
-        imgs = cls.rot(torch.tensor(np.transpose(imgs.resize(cls.size), (0, 3, 1, 2)), dtype=torch.float32))
-        ssim_flows = np.zeros((n, n), dtype=np.float32)
-        with torch.inference_mode():
-            for i in range(n-1):
-                ssim_flows[i, i+1:] = 1 - cls.score(imgs[i:i+1].expand(n-i-1,-1,-1,-1).cuda(), imgs[i+1:].cuda()).numpy()
-                ssim_flows[i+1:, i] = ssim_flows[i, i+1:]
-            return ssim_flows
+        ssim_flows = torch.zeros((n, n), dtype=torch.float32)
+        for i in range(n-1):
+            ssim_flows[i, i+1:] = 1 - cls.score(imgs[i:i+1].expand(n-i-1,-1,-1,-1), imgs[i+1:])
+            ssim_flows[i+1:, i] = ssim_flows[i, i+1:]
+        return ssim_flows
 
 
 class Lightglue(object):
@@ -129,79 +134,62 @@ class Lightglue(object):
     }).cuda().eval()
     
     @classmethod
-    def match(cls, p1, p2):
-        k1 = p1['keypoints']
-        k2 = p2['keypoints']
+    def match(cls, p1s, p2s):
+        k1s = p1s['keypoints']
+        k2s = p2s['keypoints']
         with torch.inference_mode():
-            _, indices = cls.matcher(p1['descriptors'][0], p2['descriptors'][0], KF.laf_from_center_scale_ori(k1), KF.laf_from_center_scale_ori(k2))
-            time.sleep(1)
-            k1 = k1[0].cpu().numpy()
-            k2 = k2[0].cpu().numpy()
-            indices = indices.cpu().numpy()
-        mk1 = np.float32(k1[indices[..., 0]])
-        mk2 = np.float32(k2[indices[..., 1]])
-        try:
-            _, inliers = cv2.findFundamentalMat(mk1, mk2, cv2.USAC_MAGSAC, ransacReprojThreshold=5, confidence=0.9999, maxIters=50000)
-            inliers = inliers.ravel() > 0
-            return len(inliers)
-        except:
-            return 0
+            _, indices = cls.matcher(p1s['descriptors'], p2s['descriptors'], KF.laf_from_center_scale_ori(k1s[None]), KF.laf_from_center_scale_ori(k2s[None]))
+            mk1s = k1s[indices[:, 0]].cpu().numpy()
+            mk2s = k2s[indices[:, 1]].cpu().numpy()
+            try:
+                _, inliers = cv2.findFundamentalMat(mk1s, mk2s, cv2.USAC_MAGSAC, ransacReprojThreshold=5, confidence=0.9999, maxIters=50000)
+                inliers = inliers.ravel() > 0
+                return len(inliers)
+            except:
+                return 0
 
 class Aliked_LightGlue(object):
     sizes = (1024, 1280, 1600)
     aliked_extractor = ALIKED(model_name="aliked-n16").cuda().eval()
 
     @classmethod
-    def numpy_image_to_torch(cls, img):
-        if img.ndim == 3:
-            img = img.transpose((2, 0, 1))  # HxWxC to CxHxW
-        elif img.ndim == 2:
-            img = img[None]
-        else:
-            raise ValueError(f"Not an image: {img.shape}")
-        return torch.tensor(img / 255.0, dtype=torch.float32)[None]
+    def resize(cls, imgs, size_i):
+        return [torch.tensor(np.transpose(i / 255., (2, 0, 1)), dtype=torch.float32) for i in imgs.resize(cls.sizes[size_i])]
 
     @classmethod
-    def pred(cls, img, size, rot):
-        img = cls.numpy_image_to_torch(img.resize(size))
-        tensor = torch.rot90(img, rot, (2, 3)).cuda()
-        h, w = tensor.shape[2:4]
-        hw = torch.tensor([w-1, h-1]).reshape((1,1,1,2)).to(tensor.device)
-        res = cls.aliked_extractor(tensor)
+    def extract(cls, img):
+        res = cls.aliked_extractor(img[None].cuda())
         # 原始区间[-1, 1]，转换到[0, h-1]和[0, w-1]区间内
-        res['keypoints'] = hw * (torch.stack(res['keypoints']) + 1) / 2.0
+        wh = (torch.tensor(img.shape[2:0:-1]) - 1).reshape((1,2)).cuda()
+        res['keypoints'] = wh * (res['keypoints'][0] + 1) / 2.0
+        res['descriptors'] = res['descriptors'][0]
         return res
 
-
     @classmethod
-    def match(cls, p1_f, p2_f):
-        rot, num_matches = 0, 0
-        for ori in range(4):
-            n = Lightglue.match(p1_f(0, 0), p2_f(0, ori))
-            if n > num_matches:
-                rot = ori
-                num_matches = n
-        for size_i in range(len(cls.sizes)):
-            num_matches += Lightglue.match(p1_f(size_i, 0), p2_f(size_i, rot))
-        return num_matches
+    def rot(cls, imgs):
+        imgs4 = [[torch.rot90(i, rot, (1, 2)) for rot in range(4)] for i in cls.resize(imgs, 0)]
+        rots = [0 for _ in imgs]
+        for i in range(1, len(imgs)):
+            num_matches = 0
+            for j in range(4):
+                res = Lightglue.match(cls.extract(imgs4[0][0]), cls.extract(imgs4[i][j]))
+                if res > num_matches:
+                    rots[i] = j
+                    num_matches = res
+        return rots
 
     @classmethod
     def flows(cls, imgs):
-        cache = [[[None for _ in range(4)] for _ in cls.sizes] for _ in imgs]
-
-        def f(img_i):
-            def g(size_i, rot):
-                if cache[img_i][size_i][rot] is None:
-                    cache[img_i][size_i][rot] = cls.pred(imgs[img_i], cls.sizes[size_i], rot)
-                return cache[img_i][size_i][rot]
-            return g
-        
         n = len(imgs)
-        res = np.zeros((n, n), dtype=np.float32)
+        rots = cls.rot(imgs)
+        imgs3 = [cls.resize(imgs, i) for i in range(len(cls.sizes))]
+        imgs3 = [[torch.rot90(imgs3[i][j], rots[j], (1, 2)) for i in range(len(cls.sizes))] for j in range(n)]
+        res = torch.zeros((n, n), dtype=torch.float32)
         for i in range(n):
             res[i, i] = 0
             for j in range(i+1, n):
-                res[i, j] = int(1e8 / cls.match(f(i), f(j)))
+                v = sum([Lightglue.match(cls.extract(i1), cls.extract(i2)) for i1, i2 in zip(imgs3[i], imgs3[j])])
+                res[i, j] = int(1e8 / v)
                 res[j, i] = res[i, j]
         return res
     
@@ -215,20 +203,22 @@ def main():
     scenes = ["transp_obj_glass_cylinder"]
     category = Category("train/categories.csv")
     for scene in scenes:
-        torch.cuda.empty_cache()
+        
         gc.collect()
         
         # print(f"{scene=} {category.query(scene)=} {category.transparent(scene)=} {category.use_crops(scene)=}")
 
         imgs = Imgs(f"train/{scene}/images")
         if category.transparent(scene):
-            ssim_flows = Ssim.flows(imgs)
-            # matching_flows = Aliked_LightGlue.flows(imgs)
-            plt.imshow(ssim_flows)
+            # ssim_flows = Ssim.flows(imgs)
+            matching_flows = Aliked_LightGlue.flows(imgs)
+            plt.imshow(matching_flows)
             plt.colorbar()
             plt.show()
 
             Rmats = get_rmats(len(imgs))
     
     # results_df = pd.DataFrame(columns=['image_path', 'dataset', 'scene', 'rotation_matrix', 'translation_vector'])
-main()
+
+if __name__ == "__main__":
+    main()
