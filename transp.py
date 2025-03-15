@@ -2,20 +2,34 @@ from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 import torch
 import kornia.feature as KF
+from os.path import join
 from glob import glob
 import pandas as pd
 import numpy as np
 import cv2
+import re
 import gc
 
 from nets.aliked import ALIKED
-import matplotlib.pyplot as plt
 from pickle import dump, load
 
+class Config(object):
+    dir = r"F:/Test"
+    category = join(dir, f"train/categories.csv")
+    columns = [
+        'image_path',
+        'dataset',
+        'scene',
+        'rotation_matrix',
+        'translation_vector']
+    scenes = {
+        "transparent": ["transp_obj_glass_cylinder"]
+    }
+    
 
 class Category(object):
-    def __init__(self, path):
-        self.data = pd.read_csv(path)
+    def __init__(self):
+        self.data = pd.read_csv(Config.category)
 
     def query(self, scene):
         return self.data['categories'][self.data['scene'] == scene].item()
@@ -278,23 +292,18 @@ class R(object):
         return arr2str(self.data)
 
 
-class Const(object):
-    category = "train/categories.csv"
-    columns = ['image_path', 'dataset', 'scene', 'rotation_matrix', 'translation_vector']
-
-
 class Transp(object):
-    @classmethod
-    def initialization(cls, scenes):
-        category = Category(Const.category)
+    def __init__(self, config):
+        self.dir = config.dir
+        cat = Category()
         res = []
-        for scene in scenes:
+        for scene in config.scenes['transparent']:
             torch.cuda.empty_cache()
             gc.collect()
             # print(f"{scene=} {category.query(scene)=} {category.transparent(scene)=} {category.use_crops(scene)=}")
-            paths = sorted(glob(f"train/{scene}/images/*"))
+            paths = sorted(glob(join(config.dir, f"train/{scene}/images/*")))
             # imgs = Imgs(paths)
-            if category.transparent(scene):
+            if cat.transparent(scene):
                 # ssim_flows = Ssim.flows(imgs)
                 # matching_flows = LightGlue.flows(imgs)
                 # with open("flows.pkl", "wb") as f:
@@ -303,26 +312,19 @@ class Transp(object):
                     ssim_flows, matching_flows = load(f)
                 distance_matrix = np.int32((ssim_flows + matching_flows) * 1e6)
                 order_idx = Tsp.find(distance_matrix)
-                res.extend(cls.rt(paths, order_idx))
-        return pd.DataFrame(res, columns=Const.columns)
+                res.extend(self.rt(paths, order_idx))
+        self.df = pd.DataFrame(res, columns=config.columns)
 
-    @classmethod
-    def rt(cls, paths, order_idx):
+    def rt(self, paths, order_idx):
         Rf = R.preset(len(paths))
         res = []
         for fid, fname in enumerate(paths):
             r = Rf([np.where(order_idx == fid)[0]])
-            T = np.array([100, 100, 100])
-            ds = fname.split('/')[-4:]
+            t = np.array([100, 100, 100])
+            ds = re.split(r'[\\/]', fname)[-4:]
             image_id = '/'.join(ds)
-            res.append([image_id, ds[1], ds[1], str(r), arr2str(T)])
+            res.append([image_id, ds[1], ds[1], str(r), arr2str(t)])
         return res
 
-    @classmethod
-    def submit(cls, scenes=["transp_obj_glass_cylinder"]):
-        res_df = cls.initialization(scenes)
-        res_df.to_csv(f"transp_submission.csv", index=False)
-        
-
-if __name__ == "__main__":
-    Transp.submit()
+    def submit(self):
+        self.df.to_csv(join(self.dir, f"transp_submission.csv"), index=False)

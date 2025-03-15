@@ -1,6 +1,4 @@
-import matplotlib.pyplot as plt
-from main import Img, Aliked_LightGlue, Lightglue
-from torchmetrics.image import StructuralSimilarityIndexMeasure
+from transp import Aliked, LightGlue
 import numpy as np
 import kornia.feature as KF
 from glob import glob
@@ -22,12 +20,12 @@ def to_tensor(img):
 def display_lightblue_matches(index1, index2):
     i1 = imread(index1)
     i2 = imread(index2)
-    p1s = Aliked_LightGlue.extract(to_tensor(i1))
-    p2s = Aliked_LightGlue.extract(to_tensor(i2))
+    p1s = Aliked.extract(to_tensor(i1))
+    p2s = Aliked.extract(to_tensor(i2))
     k1s = p1s['keypoints']
     k2s = p2s['keypoints']
     with torch.inference_mode():
-        distances, indices = Lightglue.matcher(p1s['descriptors'], p2s['descriptors'], KF.laf_from_center_scale_ori(k1s[None]), KF.laf_from_center_scale_ori(k2s[None]))
+        distances, indices = LightGlue.matcher(p1s['descriptors'], p2s['descriptors'], KF.laf_from_center_scale_ori(k1s[None]), KF.laf_from_center_scale_ori(k2s[None]))
         mk1s = [cv2.KeyPoint(x=i[0], y=i[1], size=1) for i in k1s[indices[:, 0]].cpu().numpy()]
         mk2s = [cv2.KeyPoint(x=i[0], y=i[1], size=1) for i in k2s[indices[:, 1]].cpu().numpy()]
         dmatch = [cv2.DMatch(i, i, int(distances.ravel()[i])) for i in range(len(indices))]
