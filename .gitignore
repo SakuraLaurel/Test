@@ -2,5 +2,6 @@ models/
 nets/
 test/
 train/
+__pycache__/
 sample_submission.csv
 test.py
