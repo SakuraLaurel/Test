@@ -64,8 +64,8 @@ class Img(object):
 
 
 class Imgs(object):
-    def __init__(self, dir):
-        self.data = list(map(Img, sorted(glob(f"{dir}/*"))[:]))
+    def __init__(self, paths):
+        self.data = list(map(Img, paths))
 
     def resize(self, size, square=False):
         return [img.resize(size, square=square) for img in self.data]
@@ -262,34 +262,67 @@ class Tsp(object):
         res[1:, 1:] = cls.normalize(distance_matrix)
         return cls.solve(res, 0)[1:] - 1
 
+def arr2str(arr):
+    return ';'.join([str(x) for x in arr.reshape(-1)])
 
-def get_rmats(n):
-    theta = 2 * torch.pi / n
-    return [cv2.Rodrigues(np.array([0, 0, 1]) * theta * i)[0]
-            for i in range(n)]
+class R(object):
+    @classmethod
+    def preset(cls, n):
+        return lambda index: cls(index, n)
+    
+    def __init__(self, index, n):
+        theta = 2 * torch.pi / n
+        self.data = cv2.Rodrigues(np.array([0, 0, 1]) * theta * index)[0]
+    
+    def __str__(self):
+        return arr2str(self.data)
 
 
-def main():
-    scenes = ["transp_obj_glass_cylinder"]
-    category = Category("train/categories.csv")
-    for scene in scenes:
-        torch.cuda.empty_cache()
-        gc.collect()
-        # print(f"{scene=} {category.query(scene)=} {category.transparent(scene)=} {category.use_crops(scene)=}")
-        # imgs = Imgs(f"train/{scene}/images")
-        if category.transparent(scene):
-            # ssim_flows = Ssim.flows(imgs)
-            # matching_flows = LightGlue.flows(imgs)
-            # with open("flows.pkl", "wb") as f:
-                # dump((ssim_flows, matching_flows), f)
-            with open("flows.pkl", "rb") as f:
-                ssim_flows, matching_flows = load(f)
-            distance_matrix = np.int32((ssim_flows + matching_flows) * 1e6)
-            print(Tsp.find(distance_matrix))
-            # rmats(len(imgs))
+class Const(object):
+    category = "train/categories.csv"
+    columns = ['image_path', 'dataset', 'scene', 'rotation_matrix', 'translation_vector']
 
-    # results_df = pd.DataFrame(columns=['image_path', 'dataset', 'scene', 'rotation_matrix', 'translation_vector'])
 
+class Transp(object):
+    @classmethod
+    def initialization(cls, scenes):
+        category = Category(Const.category)
+        res = []
+        for scene in scenes:
+            torch.cuda.empty_cache()
+            gc.collect()
+            # print(f"{scene=} {category.query(scene)=} {category.transparent(scene)=} {category.use_crops(scene)=}")
+            paths = sorted(glob(f"train/{scene}/images/*"))
+            # imgs = Imgs(paths)
+            if category.transparent(scene):
+                # ssim_flows = Ssim.flows(imgs)
+                # matching_flows = LightGlue.flows(imgs)
+                # with open("flows.pkl", "wb") as f:
+                    # dump((ssim_flows, matching_flows), f)
+                with open("flows.pkl", "rb") as f:
+                    ssim_flows, matching_flows = load(f)
+                distance_matrix = np.int32((ssim_flows + matching_flows) * 1e6)
+                order_idx = Tsp.find(distance_matrix)
+                res.extend(cls.rt(paths, order_idx))
+        return pd.DataFrame(res, columns=Const.columns)
+
+    @classmethod
+    def rt(cls, paths, order_idx):
+        Rf = R.preset(len(paths))
+        res = []
+        for fid, fname in enumerate(paths):
+            r = Rf([np.where(order_idx == fid)[0]])
+            T = np.array([100, 100, 100])
+            ds = fname.split('/')[-4:]
+            image_id = '/'.join(ds)
+            res.append([image_id, ds[1], ds[1], str(r), arr2str(T)])
+        return res
+
+    @classmethod
+    def submit(cls, scenes=["transp_obj_glass_cylinder"]):
+        res_df = cls.initialization(scenes)
+        res_df.to_csv(f"transp_submission.csv", index=False)
+        
 
 if __name__ == "__main__":
-    main()
+    Transp.submit()
